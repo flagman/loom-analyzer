@@ -1,12 +1,12 @@
 ---
-name: loom-screenshots
-description: Extract still frames (screenshots) from a Loom video. Use whenever the user provides a Loom URL (loom.com/share/... or loom.com/embed/...) and asks for screenshots, frames, stills, thumbnails, or wants to capture moments — at specific timecodes, at regular intervals, or at scene changes. ALSO trigger proactively when working with a Loom video transcript that is hard to follow without visuals — e.g. the transcript contains deictic references ("look here", "this button", "as you can see", "вот тут", "эта кнопка", "вот это окно", "смотрите сюда"), references UI elements / what's on screen without describing them, or the user says they don't understand what's being shown / discussed in the video. In those cases pull frames at the timecodes where the ambiguity occurs (or at scene changes if no timecodes are present) so the user can actually see what the speaker is pointing at. Also trigger on Russian phrases like "скриншот из loom", "кадры из loom", "сделай скрин из лум видео", "вытащи кадр из loom", "не понятно что показывают", "что там за кнопка", "посмотри что в видео".
-allowed-tools: Bash(*/loom_screenshots.sh*), Bash(yt-dlp*), Bash(ffmpeg*), Bash(open*), Bash(ls*), Bash(mkdir*), Read
+name: loom-analyzer
+description: Read Loom videos — pull the transcript, pick the moments that matter for the task at hand, and extract still frames as visual proof. Use whenever the user provides a Loom URL (loom.com/share/... or loom.com/embed/...) for ANY of these reasons — (a) explicit screenshot ask ("сделай скрин на 1:23", "frames every 10 seconds"), (b) wants to understand or summarize what's in the video ("разбери видео", "что там показывают", "пройдись по лум и достань детали", "дополни тикет по этому видео"), (c) is working with a Loom URL inside a Jira ticket / GitLab MR / spec where the recording is the source of truth, (d) is reading a transcript that's hard to follow without visuals — deictic references ("look here", "this button", "вот тут", "эта кнопка", "смотрите сюда"), UI elements mentioned but not described, or the user says they don't follow what's being shown. The skill's primary mode is transcript-first: download the VTT (fast, no video), let the model pick timecodes by the user's actual question, then extract only those frames. Falls back to scene-change extraction if the video has no captions. Also trigger on Russian phrases like "скриншот из loom", "кадры из loom", "вытащи кадр из лум", "не понятно что показывают", "что там за кнопка", "посмотри что в видео", "перескажи лум", "выжимка из видео".
+allowed-tools: Bash(*/loom_analyzer.sh*), Bash(yt-dlp*), Bash(ffmpeg*), Bash(open*), Bash(ls*), Bash(mkdir*), Read
 ---
 
-# Loom Screenshots
+# Loom Analyzer
 
-Extracts still frames from a Loom video by combining `yt-dlp` (download) + `ffmpeg` (frame extraction). Wrapped in `scripts/loom_screenshots.sh`.
+Reads a Loom video the way a person would: pull the transcript, decide which moments matter for the task at hand, then extract still frames as proof. Wraps `yt-dlp` (transcript via Loom GraphQL + video download) and `ffmpeg` (frame extraction). The script is `scripts/loom_analyzer.sh`.
 
 ## Pick a mode
 
@@ -17,46 +17,80 @@ The user will want one of these. If their request is ambiguous, ask — don't gu
 | Frames at known moments | `--at` | "скрин на 1:23 и 2:45", "frame at 0:30" |
 | A frame every N seconds | `--every` | "кадр каждые 10 секунд", "thumbnail grid" |
 | Only when the screen changes | `--scenes` | "ключевые кадры", "scene changes", "where slides change" |
-| Decode an opaque transcript | `--at` (derived) | see below |
+| Just the transcript (no video) | `--transcript-only` | "что говорят в видео", "перескажи лум", "выжимка" |
+| Decode an opaque video / link | **transcript-first** workflow (see below) | "что в этом видео", "разбери видео по тикету", you have a Loom URL but no clear ask |
 
 A single screenshot is just `--at` with one timecode.
 
-## Decoding an opaque transcript
+**Default to transcript-first** when the user gives you a Loom URL with vague intent ("разбери", "что там", "пройдись по видео и достань детали", "дополни тикет"), or when you need to make sense of *what's* on screen. Blind `--scenes` produces dozens of frames you then have to manually triage; the transcript tells you exactly which moments matter for the question at hand.
 
-If you've been handed a Loom URL plus a transcript and the transcript is hard to follow without visuals (a Loom recording is *primarily* visual — a person points at things on a screen), don't make the user beg for screenshots. Offer them, or just pull them, depending on how stuck the user sounds.
+## Transcript-first workflow (the main loop)
 
-**Signals that the transcript needs visual backup:**
+The most useful thing this skill does isn't "give me 30 random frames" — it's "tell me *what's actually being shown and discussed*, with proof". The flow is two phases:
 
-- **Deictic references with no antecedent** — "click here", "this button", "that field", "вот тут", "эта штука", "вот это окно", "смотрите сюда". The speaker is pointing at the screen; the words alone don't say *what*.
-- **UI / state references without description** — "the error", "the dropdown", "the highlighted row", "красный текст".
-- **"As you can see" / "as I'm doing now"** — explicit appeals to vision.
-- **The user explicitly says** they don't follow what's happening, asks "что они показывают?", or says the transcript is confusing.
+### Phase 1 — read what's said
 
-**How to act:**
-
-1. Find the timecodes in the transcript where the dieictic references occur. Most Loom transcripts have `[MM:SS]` or `MM:SS` markers per segment.
-2. Pass those timecodes to `--at` (you can pass many at once, comma-separated). Add a small offset (e.g. +1 second) if the speaker says "here" — by the time they say it, the screen is usually already showing the thing.
-3. If the transcript has no timecodes, fall back to `--scenes` to grab the screen states; then map them back to the transcript flow.
-4. After extraction, walk through the frames with the user inline — `Read` each PNG so Claude Code can see and describe it, then connect each frame to the transcript line it explains.
-
-**Example flow (you don't need user permission for the screenshot step — it's the obvious next move):**
-
-> User: "Вот транскрипт из лум-видео https://www.loom.com/share/abc123 — не пойму, что они там показывают на 1:14 и 2:30, говорят 'вот тут ошибка, видишь?' но я не вижу"
-
-Run:
+Pull the VTT transcript first. It's fast (no video download, just GraphQL via yt-dlp), and gives you timestamped segments:
 
 ```bash
-"$SCRIPT" "https://www.loom.com/share/abc123" --at "1:15,2:31" --out ./frames
+"$SCRIPT" "$URL" --transcript-only --out ./loom-work
+# → ./loom-work/<video_id>.en.vtt
 ```
 
-Then `Read` both PNGs and explain to the user what's actually on the screen at each moment, tying it back to the transcript lines.
+For Russian-language recordings the VTT will already be in Russian — no `--lang` needed (Loom's auto-CC matches the spoken language). Override with `--lang ru` etc. if a video has multiple subtitle tracks.
+
+`Read` the VTT. Each segment looks like:
+
+```
+3
+00:00:23.190 --> 00:00:28.004
+Точек, точек, точек. Вот видишь бук онлайн, вот он их этот,
+
+4
+00:00:28.004 --> 00:00:31.444
+экшн-батюн, смотри,
+```
+
+### Phase 2 — pick moments that answer the question
+
+Now use your understanding of the user's task to choose *which* timecodes matter. Don't pull frames for every line — that defeats the point. You're looking for:
+
+- **Deictic anchors** — "вот тут", "this button", "as you can see", "look here". The speaker is pointing at something; the frame at that moment is the antecedent.
+- **Topic-relevant claims** — if the user is asking about Acceptance Criteria, find lines where the speaker describes a behavior or shows a counter-example. If they want a bug repro, find the moment of failure.
+- **Transitions** — moments right after the speaker says "let's look at the next one" / "теперь" / "следующий пример" — likely a new screen worth capturing.
+
+Add a small offset (~1s) to the segment's *end* timestamp when the speaker says "here" / "вот это" — by the time the word is uttered, the screen is usually already showing the thing.
+
+Then pull only those frames:
+
+```bash
+"$SCRIPT" "$URL" --at "0:30,1:14,2:31" --out ./loom-work/frames
+```
+
+### Phase 3 — synthesize
+
+`Read` each PNG so you can actually see what's on screen, then write the user a synthesis tying transcript line ↔ frame ↔ task. Don't dump raw transcripts and 12 image paths — distill it.
+
+### When transcript fails
+
+- **No CC available** for the video → the script exits with an error. Fall back to `--scenes` and walk the user through what you see.
+- **Transcript exists but doesn't help** (silent demo, music-only, foreign language with bad CC) → also fall back to `--scenes`, but warn the user the transcript was unusable so they know why you're guessing more.
+
+### Signals that visual backup is needed (use as triggers, not as gospel)
+
+- Deictic references with no antecedent in the words: "click here", "this button", "вот тут".
+- UI / state references the words don't actually describe: "the error", "the dropdown", "красный текст".
+- Explicit appeals to vision: "as you can see", "as I'm doing now", "смотри".
+- The user says they don't follow what's happening, asks "что они показывают?", or says the transcript/summary is confusing.
+
+In those cases don't ask permission to pull frames — it's the obvious next move.
 
 ## Running the script
 
-The script lives at `scripts/loom_screenshots.sh` (relative to this skill). Resolve its absolute path before running — for this user it's `/Users/pavel/.claude/skills/loom-screenshots/scripts/loom_screenshots.sh`.
+The script lives at `scripts/loom_analyzer.sh` (relative to this skill). Resolve its absolute path before running — for this user it's `/Users/pavel/.claude/skills/loom-analyzer/scripts/loom_analyzer.sh`.
 
 ```bash
-SCRIPT=/Users/pavel/.claude/skills/loom-screenshots/scripts/loom_screenshots.sh
+SCRIPT=/Users/pavel/.claude/skills/loom-analyzer/scripts/loom_analyzer.sh
 chmod +x "$SCRIPT"  # first run only
 
 # Specific moments

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Extract screenshots from a Loom video using yt-dlp + ffmpeg.
+# Read a Loom video: pull transcript and/or extract still frames using yt-dlp + ffmpeg.
 set -euo pipefail
 
 URL=""
@@ -10,20 +10,24 @@ SCENE_THRESHOLD="0.3"
 OUT_DIR="./loom-frames"
 KEEP_VIDEO=0
 QUALITY="high"
+TRANSCRIPT_ONLY=0
+SUB_LANG="en"
 
 usage() {
   cat <<'EOF' >&2
-Usage: loom_screenshots.sh <loom-url> <mode> [options]
+Usage: loom_analyzer.sh <loom-url> <mode> [options]
 
 Modes (pick one):
   --at "00:01:23,2:34,150"   Frames at specific timecodes (HH:MM:SS, MM:SS, or seconds)
   --every N                   One frame every N seconds
   --scenes [THRESHOLD]        Frames at scene changes (default threshold 0.3, range 0.1-0.6)
+  --transcript-only           Download VTT transcript only (skip video). Combine with --lang.
 
 Options:
-  --out DIR                   Output directory (default: ./loom-frames)
+  --out DIR                   Output directory (default: ./loom-frames; transcript goes here too)
   --keep-video                Keep the downloaded mp4 (saved as <out>/video.mp4)
   --quality high|low          Video quality (default: high)
+  --lang CODE                 Subtitle language (default: en) — used with --transcript-only
   -h, --help                  Show this help
 EOF
   exit 1
@@ -41,8 +45,8 @@ fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --at)         TIMES="$2"; shift 2 ;;
-    --every)      INTERVAL="$2"; shift 2 ;;
+    --at)               TIMES="$2"; shift 2 ;;
+    --every)            INTERVAL="$2"; shift 2 ;;
     --scenes)
       SCENES=1
       if [[ "${2:-}" =~ ^0?\.[0-9]+$ ]]; then
@@ -51,31 +55,61 @@ while [[ $# -gt 0 ]]; do
         shift
       fi
       ;;
-    --out)        OUT_DIR="$2"; shift 2 ;;
-    --keep-video) KEEP_VIDEO=1; shift ;;
-    --quality)    QUALITY="$2"; shift 2 ;;
-    -h|--help)    usage ;;
+    --transcript-only)  TRANSCRIPT_ONLY=1; shift ;;
+    --out)              OUT_DIR="$2"; shift 2 ;;
+    --keep-video)       KEEP_VIDEO=1; shift ;;
+    --quality)          QUALITY="$2"; shift 2 ;;
+    --lang)             SUB_LANG="$2"; shift 2 ;;
+    -h|--help)          usage ;;
     *) echo "Unknown arg: $1" >&2; usage ;;
   esac
 done
 
-modes=0
-[[ -n "$TIMES" ]]    && ((modes++)) || true
-[[ -n "$INTERVAL" ]] && ((modes++)) || true
-[[ -n "$SCENES" ]]   && ((modes++)) || true
-if [[ $modes -ne 1 ]]; then
-  echo "Error: choose exactly one of --at, --every, --scenes" >&2
-  usage
+if [[ $TRANSCRIPT_ONLY -eq 1 ]]; then
+  if [[ -n "$TIMES" || -n "$INTERVAL" || -n "$SCENES" ]]; then
+    echo "Error: --transcript-only doesn't take a frame mode" >&2
+    usage
+  fi
+else
+  modes=0
+  [[ -n "$TIMES" ]]    && ((modes++)) || true
+  [[ -n "$INTERVAL" ]] && ((modes++)) || true
+  [[ -n "$SCENES" ]]   && ((modes++)) || true
+  if [[ $modes -ne 1 ]]; then
+    echo "Error: choose exactly one of --at, --every, --scenes (or --transcript-only)" >&2
+    usage
+  fi
 fi
 
-for cmd in yt-dlp ffmpeg; do
-  if ! command -v "$cmd" >/dev/null 2>&1; then
-    echo "Error: $cmd not found. Install: brew install $cmd" >&2
-    exit 2
-  fi
-done
+if ! command -v yt-dlp >/dev/null 2>&1; then
+  echo "Error: yt-dlp not found. Install: brew install yt-dlp" >&2
+  exit 2
+fi
+if [[ $TRANSCRIPT_ONLY -eq 0 ]] && ! command -v ffmpeg >/dev/null 2>&1; then
+  echo "Error: ffmpeg not found. Install: brew install ffmpeg" >&2
+  exit 2
+fi
 
 mkdir -p "$OUT_DIR"
+
+if [[ $TRANSCRIPT_ONLY -eq 1 ]]; then
+  echo "→ Downloading VTT transcript ($SUB_LANG) from $URL" >&2
+  STEM=$(yt-dlp --no-warnings --print "%(id)s" --skip-download "$URL" 2>/dev/null | head -1)
+  STEM=${STEM:-loom-transcript}
+  yt-dlp -q --no-warnings --skip-download \
+    --write-subs --sub-langs "$SUB_LANG" --sub-format vtt \
+    -o "$OUT_DIR/$STEM" "$URL" \
+    || { echo "Error: no $SUB_LANG subtitles available for this video" >&2; exit 3; }
+  VTT_PATH=$(ls "$OUT_DIR/$STEM"*."$SUB_LANG".vtt 2>/dev/null | head -1)
+  if [[ -z "$VTT_PATH" ]]; then
+    echo "Error: VTT not produced. yt-dlp may have failed silently." >&2
+    exit 3
+  fi
+  echo "✓ Transcript saved: $VTT_PATH" >&2
+  echo "$VTT_PATH"
+  exit 0
+fi
+
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 

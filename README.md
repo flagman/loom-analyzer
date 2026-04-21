@@ -1,12 +1,12 @@
-# loom-screenshots
+# loom-analyzer
 
-A [Claude Code skill](https://docs.claude.com/en/docs/claude-code/skills) that pulls still frames out of a [Loom](https://www.loom.com) video — at specific timecodes, at regular intervals, or at scene changes.
+A [Claude Code skill](https://docs.claude.com/en/docs/claude-code/skills) that lets Claude **read a Loom video**: pull the transcript, decide which moments matter for the task at hand, then extract still frames as visual proof.
 
-It's a thin wrapper around `yt-dlp` (download) + `ffmpeg` (extract) packaged so Claude Code triggers it automatically when you mention a Loom URL and screenshots, **or** when you're trying to make sense of a Loom transcript that doesn't make sense without seeing the screen.
+It's a thin wrapper around `yt-dlp` (transcript via Loom's GraphQL + video download) and `ffmpeg` (frame extraction), packaged so Claude Code triggers it automatically when a Loom URL shows up — whether you ask for screenshots explicitly or are just trying to make sense of a recording referenced in a Jira ticket / spec / MR.
 
 ## Why
 
-Loom recordings are primarily visual — someone points at things on a screen and says "here", "this button", "as you can see". Transcripts of those recordings are often near-useless on their own. This skill lets Claude Code pull the relevant frames so it (and you) can actually see what the speaker is talking about.
+Loom recordings are primarily visual. Someone points at things on a screen and says "here", "this button", "as you can see". The transcript alone is full of dangling references; a wall of 30 random scene-change frames is just as bad. The interesting middle is **transcript-first**: read what's said, pick the 3–5 moments that actually answer the question, then pull only those frames. That's what this skill does.
 
 ## Requirements
 
@@ -21,15 +21,20 @@ That's it. No API keys, no Loom account needed — works for any Loom video that
 ## Install
 
 ```bash
-git clone https://github.com/flagman/loom-screenshots.git ~/.claude/skills/loom-screenshots
-chmod +x ~/.claude/skills/loom-screenshots/scripts/loom_screenshots.sh
+git clone https://github.com/flagman/loom-analyzer.git ~/.claude/skills/loom-analyzer
+chmod +x ~/.claude/skills/loom-analyzer/scripts/loom_analyzer.sh
 ```
 
-Restart Claude Code (or reload skills) and you'll see `loom-screenshots` in the available skills list.
+Restart Claude Code (or reload skills) and you'll see `loom-analyzer` in the available skills list.
 
-## Usage
+## Usage with Claude Code
 
-Just talk to Claude Code naturally. It picks the right mode from your phrasing.
+Just talk naturally — the skill triggers itself.
+
+**Make sense of a video referenced in a ticket** (the killer use case)
+> "Дополни тикет STARTUP-4736 деталями из лум-видео в описании"
+
+Claude pulls the VTT, finds the moments where the speaker points at specific UI ("вот видишь Book Online"), extracts only those frames, reads them, and writes a synthesis tying transcript line ↔ screenshot ↔ ticket AC.
 
 **Specific moments**
 > "Сделай скриншоты из https://www.loom.com/share/abc123 на 1:23 и 2:45"
@@ -40,17 +45,19 @@ Just talk to Claude Code naturally. It picks the right mode from your phrasing.
 **Scene changes (good for slide decks / screen-share)**
 > "Get the key frames from https://www.loom.com/share/abc123 — only where the screen actually changes"
 
-**Decoding an opaque transcript (the killer use case)**
-> "Here's the transcript from https://www.loom.com/share/abc123. They keep saying 'click this' and 'see the error here' but I can't follow what they're showing. Help me make sense of it."
-
-In the last case the skill scans the transcript for deictic references ("this", "here", "вот тут"), extracts frames at those exact timecodes, and Claude reads the PNGs back so it can describe what's actually on screen at each moment — tied to the transcript line that needed it.
+**Just the transcript, no frames**
+> "What does this Loom say? https://www.loom.com/share/abc123"
 
 ## Direct script usage
 
 If you want to run it without Claude:
 
 ```bash
-SCRIPT=~/.claude/skills/loom-screenshots/scripts/loom_screenshots.sh
+SCRIPT=~/.claude/skills/loom-analyzer/scripts/loom_analyzer.sh
+
+# Transcript only (fast, no video download)
+"$SCRIPT" "https://www.loom.com/share/<id>" --transcript-only --out ./loom-work
+# → ./loom-work/<video_id>.en.vtt
 
 # Frames at specific timecodes
 "$SCRIPT" "https://www.loom.com/share/<id>" --at "0:23,1:45,3:10" --out ./frames
@@ -70,19 +77,23 @@ URLs accepted: `loom.com/share/...`, `loom.com/embed/...`, or just the bare vide
 
 Timecodes accepted: `HH:MM:SS`, `MM:SS`, or plain seconds — comma-separated for multiple.
 
+Subtitle language defaults to whatever Loom's auto-CC produced for the video (usually matches the spoken language). Override with `--lang ru` etc. if a video has multiple subtitle tracks.
+
 ## What it can't do
 
 - **Private Loom videos** that require login. The skill uses `yt-dlp` against the public share URL — if Loom asks for auth, it can't get past it. For private videos look at the cookie-based [karbassi/mcp-loom](https://github.com/karbassi/loom-mcp) MCP server instead.
-- **Audio extraction / video editing** — out of scope. This is a screenshot tool.
+- **Audio extraction / video editing** — out of scope.
 
 ## How it works
 
-1. `yt-dlp -f http-transcoded` downloads the video (transcoded MP4 preferred, falls back to whatever's available) into a temp directory.
-2. `ffmpeg` extracts the frames using one of three filters depending on mode:
+1. **Transcript phase** (`--transcript-only`): `yt-dlp --skip-download --write-subs --sub-format vtt` hits Loom's GraphQL via yt-dlp's Loom extractor and saves a `.vtt` file. No video downloaded.
+2. **Frame phase** (`--at` / `--every` / `--scenes`): `yt-dlp -f http-transcoded` downloads the video into a temp directory, then `ffmpeg` extracts frames using the appropriate filter:
    - `--at` → input-seek (`-ss` before `-i`) for fast accurate per-timestamp extraction
    - `--every N` → `-vf fps=1/N`
    - `--scenes T` → `-vf "select=gt(scene\,T)" -vsync vfr`
 3. The temp video is deleted unless you pass `--keep-video`.
+
+When Claude orchestrates the two phases together (the typical case), it runs phase 1, reads the VTT, decides which timecodes matter for the user's actual question, then runs phase 2 with `--at <chosen times>`. Sharing the same `--out` directory keeps everything in one place.
 
 ## License
 
